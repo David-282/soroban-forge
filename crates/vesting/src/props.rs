@@ -1,34 +1,33 @@
-//! Randomized invariant suite (proptest).
-//!
-//! The hand-written unit suite pins behaviour on known, fixed values; this
-//! module systematically tests the contract's fund-safety, arithmetic conservation,
-//! and monotonicity invariants over large spaces of generated inputs.
-//!
-//! Four property invariants are exercised:
-//!
-//! **P1 — Total Conservation & Residue Safety.** For random amounts, cliffs,
-//! and durations: across arbitrary sequences of timestamps and interleaved claims,
-//! `claimed + remaining_claimable <= total_amount` holds at every point in time.
-//! Rounding residue from floor-division never leaks tokens or causes payouts to
-//! exceed `total_amount`. Upon full duration elapsed and final claim, the contract
-//! retains 0 tokens and the beneficiary holds `total_amount` exactly.
-//!
-//! **P2 — Monotonicity.** For arbitrary monotonically non-decreasing timestamp
-//! progressions: `vested(t)` is strictly monotonic non-decreasing ($t_a \le t_b \implies \text{vested}(t_a) \le \text{vested}(t_b)$),
-//! cumulative `claimed` never decreases, and `claimable` increases monotonically
-//! over time until `duration` (in the absence of claims).
-//!
-//! **P3 — Arbitrary Action Sequences.** For random sequences of time advancements
-//! and claim attempts: `claim()` returns exactly the newly vested amount or `0`,
-//! zero-amount claims make no token transfers, and total pool tokens (`beneficiary + contract`)
-//! are conserved identically.
-//!
-//! **P4 — Tamper-Resilient Conservation.** An attacker attempting to mutate stored
-//! schedule parameters (amount, claimed, start, cliff, duration) between calls can
-//! never move value out of the pool beyond the token contract's balance.
-//!
-//! Runs are deterministic with reproducible seeds. Override the case count with
-//! `PROPTEST_CASES=n cargo test -p soroban-forge-vesting props`.
+//  Randomized invariant suite (proptest).
+
+//  The hand-written unit suite pins behaviour on known, fixed values; this
+//  module systematically tests the contract's fund-safety, arithmetic conservation,
+//  and monotonicity invariants over large spaces of generated inputs.
+
+//  Four property invariants are exercised:
+
+//  **P1 — Total Conservation & Residue Safety.** For random amounts, cliffs,
+//  and durations: across arbitrary sequences of timestamps and interleaved claims,
+//  `claimed + remaining_claimable <= total_amount` holds at every point in time.
+//  Rounding residue from floor-division never leaks tokens or causes payouts to
+//  exceed `total_amount`. Upon full duration elapsed and final claim, the contract
+//  retains 0 tokens and the beneficiary holds `total_amount` exactly.
+//  **P2 — Monotonicity.** For arbitrary monotonically non-decreasing timestamp
+//  progressions: `vested(t)` is strictly monotonic non-decreasing ($t_a \le t_b \implies \text{vested}(t_a) \le \text{vested}(t_b)$),
+//  cumulative `claimed` never decreases, and `claimable` increases monotonically
+//  over time until `duration` (in the absence of claims).
+
+//  **P3 — Arbitrary Action Sequences.** For random sequences of time advancements
+//  and claim attempts: `claim()` returns exactly the newly vested amount or `0`,
+//  zero-amount claims make no token transfers, and total pool tokens (`beneficiary + contract`)
+//  are conserved identically.
+
+//  **P4 — Tamper-Resilient Conservation.** An attacker attempting to mutate stored
+//  schedule parameters (amount, claimed, start, cliff, duration) between calls can
+//  never move value out of the pool beyond the token contract's balance.
+ 
+//   Runs are deterministic with reproducible seeds. Override the case count with
+//   `PROPTEST_CASES=n cargo test -p soroban-forge-vesting props`.
 
 use crate::{SorobanForgeVestingClient, Vesting, VestingSchedule, VestingStatus};
 use proptest::prelude::*;
@@ -368,4 +367,62 @@ proptest! {
             other => panic!("unexpected outcome under tampering: {:?}", other),
         }
     }
+}
+
+use crate::Tranche;
+use crate::MAX_TRANCHES;
+
+// --- Tranche-Aware Property Invariants ---
+
+#[test]
+fn props_tranche_conservation_and_monotonicity() {
+    let mut runner = proptest::test_runner::TestRunner::new(
+        proptest::test_runner::Config::with_cases(256),
+    );
+
+    runner
+        .run(
+            &proptest::collection::vec(
+                (1u64..=1_000_000u64, 1i128..=100_000_000i128),
+                1..=(MAX_TRANCHES as usize),
+            ),
+            |raw_tranches| {
+                let w = setup_world();
+                let env = w.env.clone();
+                let client = w.vesting_client();
+
+                let mut tranches = soroban_sdk::Vec::new(&env);
+                let mut current_offset = 0u64;
+                let mut total_expected_amount = 0i128;
+
+                for (delta, amt) in raw_tranches {
+                    current_offset = current_offset.saturating_add(delta);
+                    tranches.push_back(Tranche {
+                        unlock_at: current_offset,
+                        amount: amt,
+                    });
+                    total_expected_amount = total_expected_amount.saturating_add(amt);
+                }
+
+                w.mint_to_contract(total_expected_amount);
+                let id = client.create_tranche_schedule(&w.beneficiary, &w.token, &tranches);
+
+                let mut prev_claimable = 0i128;
+                for t_advance in [0u64, current_offset / 4, current_offset / 2, current_offset, current_offset * 2] {
+                    env.ledger().set_timestamp(START.saturating_add(t_advance));
+                    let c = client.claimable(&id);
+                    assert!(c >= prev_claimable);
+                    assert!(c <= total_expected_amount);
+                    prev_claimable = c;
+                }
+
+                env.ledger().set_timestamp(START.saturating_add(current_offset.saturating_mul(2)));
+                let claimed = client.claim(&id);
+                assert_eq!(claimed, total_expected_amount);
+                assert_eq!(client.get_status(&id), VestingStatus::Completed);
+
+                Ok(())
+            },
+        )
+        .unwrap();
 }
