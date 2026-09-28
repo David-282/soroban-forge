@@ -4,11 +4,17 @@
 //! - `subscribe` requires the subscriber.
 //! - `charge` requires the provider.
 //! - `cancel` requires the subscriber.
+//! - `authorize_provider` / `revoke_provider` require the subscriber.
+//! - `subscribe_on_behalf_of` requires the provider + a subscriber opt-in.
+//! - `pause` and `resume` require the subscriber.
+//! - `charge_catchup` requires the provider and the subscriber for token transfer.
 
 use crate::{SorobanForgeSubscriptionPaymentsClient, SubscriptionPayments, SubscriptionStatus};
-use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
+use soroban_sdk::testutils::{
+    Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger as _, MockAuth, MockAuthInvoke,
+};
 use soroban_sdk::token::StellarAssetClient;
-use soroban_sdk::{Address, Env, IntoVal, InvokeError};
+use soroban_sdk::{Address, Env, IntoVal, InvokeError, Symbol};
 
 const START: u64 = 1_000_000;
 const PERIOD: u64 = 1_000;
@@ -198,4 +204,570 @@ fn cancel_rejects_provider_signature() {
 
     let sub = client.get_subscription(&id);
     assert_eq!(sub.status, SubscriptionStatus::Active);
+}
+
+#[test]
+fn authorize_provider_accepts_subscriber_signature() {
+    let (env, _token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "authorize_provider",
+            args: (subscriber, provider).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client
+        .try_authorize_provider(subscriber, provider)
+        .expect("outer ok")
+        .expect("contract ok");
+    assert!(client.is_provider_authorized(subscriber, provider));
+}
+
+#[test]
+fn authorize_provider_rejects_non_subscriber_signature() {
+    let (env, _token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    // Armed with the provider's auth instead of the subscriber's.
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "authorize_provider",
+            args: (subscriber, provider).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_authorize_provider(subscriber, provider);
+    assert_auth_abort!(res);
+    assert!(!client.is_provider_authorized(subscriber, provider));
+}
+
+#[test]
+fn revoke_provider_accepts_subscriber_signature() {
+    let (env, _token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    client.authorize_provider(subscriber, provider);
+    assert!(client.is_provider_authorized(subscriber, provider));
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "revoke_provider",
+            args: (subscriber, provider).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client
+        .try_revoke_provider(subscriber, provider)
+        .expect("outer ok")
+        .expect("contract ok");
+    assert!(!client.is_provider_authorized(subscriber, provider));
+}
+
+#[test]
+fn revoke_provider_rejects_non_subscriber_signature() {
+    let (env, _token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    client.authorize_provider(subscriber, provider);
+
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "revoke_provider",
+            args: (subscriber, provider).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_revoke_provider(subscriber, provider);
+    assert_auth_abort!(res);
+    // The opt-in survives the failed revoke.
+    assert!(client.is_provider_authorized(subscriber, provider));
+}
+
+#[test]
+fn subscribe_on_behalf_of_accepts_provider_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    client.authorize_provider(subscriber, provider);
+
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "subscribe_on_behalf_of",
+            args: (provider, subscriber, &token, AMOUNT, PERIOD).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let id = client
+        .try_subscribe_on_behalf_of(provider, subscriber, &token, &AMOUNT, &PERIOD)
+        .expect("outer ok")
+        .expect("contract ok");
+
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.subscriber, *subscriber);
+    assert_eq!(sub.provider, *provider);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+}
+
+#[test]
+fn subscribe_on_behalf_of_rejects_provider_without_subscriber_opt_in() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    // No opt-in recorded: even a provider signature must fail.
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "subscribe_on_behalf_of",
+            args: (provider, subscriber, &token, AMOUNT, PERIOD).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_subscribe_on_behalf_of(provider, subscriber, &token, &AMOUNT, &PERIOD);
+    assert!(matches!(res, Err(Ok(crate::ForgeError::Unauthorized))));
+    assert_eq!(client.get_subscription_count(), 0);
+}
+
+#[test]
+fn subscribe_on_behalf_of_rejects_subscriber_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+
+    client.authorize_provider(subscriber, provider);
+
+    // The subscriber trying to call subscribe_on_behalf_of as if they were
+    // the provider: the entrypoint demands the provider's signature.
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "subscribe_on_behalf_of",
+            args: (provider, subscriber, &token, AMOUNT, PERIOD).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_subscribe_on_behalf_of(provider, subscriber, &token, &AMOUNT, &PERIOD);
+    assert_auth_abort!(res);
+    assert_eq!(client.get_subscription_count(), 0);
+}
+
+#[test]
+fn subscribe_on_behalf_of_rejects_unauthorized_third_party() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let stranger = &accounts.arbiter;
+
+    client.authorize_provider(subscriber, provider);
+
+    env.mock_auths(&[MockAuth {
+        address: stranger,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "subscribe_on_behalf_of",
+            args: (provider, subscriber, &token, AMOUNT, PERIOD).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_subscribe_on_behalf_of(provider, subscriber, &token, &AMOUNT, &PERIOD);
+    assert_auth_abort!(res);
+    assert_eq!(client.get_subscription_count(), 0);
+}
+
+#[test]
+fn pause_accepts_subscriber_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "pause",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.try_pause(&id).expect("outer ok").unwrap();
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.status, SubscriptionStatus::Paused);
+    assert_eq!(sub.paused_at, Some(START));
+}
+
+#[test]
+fn pause_rejects_provider_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    let before = client.get_subscription(&id);
+
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "pause",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_pause(&id));
+    assert_eq!(client.get_subscription(&id), before);
+}
+
+#[test]
+fn pause_rejects_third_party_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let third_party = &accounts.user3;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+
+    env.mock_auths(&[MockAuth {
+        address: third_party,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "pause",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_pause(&id));
+    assert_eq!(
+        client.get_subscription(&id).status,
+        SubscriptionStatus::Active
+    );
+}
+
+#[test]
+fn pause_rejects_signature_replayed_for_another_subscription() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let first_id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    let second_id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "pause",
+            args: (first_id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_pause(&second_id));
+    assert_eq!(
+        client.get_subscription(&first_id).status,
+        SubscriptionStatus::Active
+    );
+    assert_eq!(
+        client.get_subscription(&second_id).status,
+        SubscriptionStatus::Active
+    );
+}
+
+#[test]
+fn blank_envelope_aborts_pause_without_changing_state() {
+    let (env, token, _contract_id, client, accounts) = setup!();
+    let id = client.subscribe(&accounts.user1, &accounts.user2, &token, &AMOUNT, &PERIOD);
+    let before = client.get_subscription(&id);
+    env.mock_auths(&[]);
+
+    assert_auth_abort!(client.try_pause(&id));
+    assert_eq!(client.get_subscription(&id), before);
+}
+
+#[test]
+fn resume_accepts_subscriber_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    client.pause(&id);
+    env.ledger().set_timestamp(START + 500);
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "resume",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.try_resume(&id).expect("outer ok").unwrap();
+    let sub = client.get_subscription(&id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.paused_at, None);
+    assert_eq!(sub.last_charged, START + 500);
+}
+
+#[test]
+fn resume_rejects_non_subscriber_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    client.pause(&id);
+    let before = client.get_subscription(&id);
+
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "resume",
+            args: (id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_resume(&id));
+    assert_eq!(client.get_subscription(&id), before);
+}
+
+#[test]
+fn resume_rejects_signature_replayed_for_another_subscription() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let first_id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    let second_id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    client.pause(&first_id);
+    client.pause(&second_id);
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "resume",
+            args: (first_id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_resume(&second_id));
+    assert_eq!(
+        client.get_subscription(&first_id).status,
+        SubscriptionStatus::Paused
+    );
+    assert_eq!(
+        client.get_subscription(&second_id).status,
+        SubscriptionStatus::Paused
+    );
+}
+
+#[test]
+fn blank_envelope_aborts_resume_without_changing_state() {
+    let (env, token, _contract_id, client, accounts) = setup!();
+    let id = client.subscribe(&accounts.user1, &accounts.user2, &token, &AMOUNT, &PERIOD);
+    client.pause(&id);
+    let before = client.get_subscription(&id);
+    env.mock_auths(&[]);
+
+    assert_auth_abort!(client.try_resume(&id));
+    assert_eq!(client.get_subscription(&id), before);
+}
+
+#[test]
+fn charge_catchup_accepts_provider_and_subscriber_token_authorization() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    env.ledger().set_timestamp(START + PERIOD);
+
+    env.mock_auths(&[
+        MockAuth {
+            address: provider,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "charge_catchup",
+                args: (id, 1_u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: subscriber,
+            invoke: &MockAuthInvoke {
+                contract: &token,
+                fn_name: "transfer",
+                args: (subscriber, provider, AMOUNT).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    let billed = client
+        .try_charge_catchup(&id, &1)
+        .expect("outer ok")
+        .unwrap();
+    assert_eq!(billed, AMOUNT);
+    assert_eq!(client.get_subscription(&id).last_charged, START + PERIOD);
+}
+
+#[test]
+fn charge_catchup_rejects_subscriber_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    env.ledger().set_timestamp(START + PERIOD);
+    let before = client.get_subscription(&id);
+    let subscriber_balance = StellarAssetClient::new(&env, &token).balance(subscriber);
+
+    env.mock_auths(&[MockAuth {
+        address: subscriber,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "charge_catchup",
+            args: (id, 1_u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_charge_catchup(&id, &1));
+    assert_eq!(client.get_subscription(&id), before);
+    assert_eq!(
+        StellarAssetClient::new(&env, &token).balance(subscriber),
+        subscriber_balance
+    );
+}
+
+#[test]
+fn charge_catchup_rejects_third_party_signature() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let third_party = &accounts.user3;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    env.ledger().set_timestamp(START + PERIOD);
+
+    env.mock_auths(&[MockAuth {
+        address: third_party,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "charge_catchup",
+            args: (id, 1_u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_charge_catchup(&id, &1));
+    assert_eq!(client.get_subscription(&id).last_charged, START);
+}
+
+#[test]
+fn charge_catchup_rejects_signature_replayed_with_different_max_periods() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    env.ledger().set_timestamp(START + PERIOD * 2);
+
+    env.mock_auths(&[MockAuth {
+        address: provider,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "charge_catchup",
+            args: (id, 1_u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert_auth_abort!(client.try_charge_catchup(&id, &2));
+    assert_eq!(client.get_subscription(&id).last_charged, START);
+}
+
+#[test]
+fn blank_envelope_aborts_charge_catchup_without_changing_state_or_balances() {
+    let (env, token, _contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    env.ledger().set_timestamp(START + PERIOD);
+    let before = client.get_subscription(&id);
+    let token_client = StellarAssetClient::new(&env, &token);
+    let subscriber_balance = token_client.balance(subscriber);
+    let provider_balance = token_client.balance(provider);
+    env.mock_auths(&[]);
+
+    assert_auth_abort!(client.try_charge_catchup(&id, &1));
+    assert_eq!(client.get_subscription(&id), before);
+    assert_eq!(token_client.balance(subscriber), subscriber_balance);
+    assert_eq!(token_client.balance(provider), provider_balance);
+}
+
+#[test]
+fn charge_catchup_authorization_tree_contains_provider_and_token_transfer_frames() {
+    let (env, token, contract_id, client, accounts) = setup!();
+    let subscriber = &accounts.user1;
+    let provider = &accounts.user2;
+    let id = client.subscribe(subscriber, provider, &token, &AMOUNT, &PERIOD);
+    env.ledger().set_timestamp(START + PERIOD);
+    env.mock_all_auths_allowing_non_root_auth();
+
+    assert_eq!(client.charge_catchup(&id, &1), AMOUNT);
+
+    assert_eq!(
+        env.auths(),
+        [
+            (
+                provider.clone(),
+                AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        contract_id.clone(),
+                        Symbol::new(&env, "charge_catchup"),
+                        (id, 1_u32).into_val(&env),
+                    )),
+                    sub_invocations: std::vec![],
+                },
+            ),
+            (
+                subscriber.clone(),
+                AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        token.clone(),
+                        Symbol::new(&env, "transfer"),
+                        (subscriber, provider, AMOUNT).into_val(&env),
+                    )),
+                    sub_invocations: std::vec![],
+                },
+            ),
+        ],
+    );
 }

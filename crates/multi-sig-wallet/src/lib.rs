@@ -13,10 +13,15 @@
 //! ```text
 //! submit --(confirm × n)--> threshold met --execute--> Executed
 //! submit --(reject × n)--> rejection threshold met --> Rejected (terminal)
+//! submit_call --(confirm × n)--> threshold met --execute--> Executed (+ typed call invoked)
+//! submit_call --(reject × n)--> rejection threshold met --> Rejected (terminal)
 //! submit_withdrawal --(confirm × n)--> threshold met --execute--> Executed (+ tokens moved)
 //! submit_withdrawal --(reject × n)--> rejection threshold met --> Rejected (terminal)
 //! set_withdrawal_limit --(confirm × n)--> threshold met --execute--> Executed (limit applied)
 //! remove_withdrawal_limit --(confirm × n)--> threshold met --execute--> Executed (limit dropped)
+//! add_owner --(confirm × n)--> threshold met --execute--> Executed (owner added)
+//! remove_owner --(confirm × n)--> threshold met --execute--> Executed (owner removed)
+//! set_threshold --(confirm × n)--> threshold met --execute--> Executed (threshold changed)
 //! ```
 //!
 //! Authorization model:
@@ -24,14 +29,52 @@
 //!   re-initialisation).
 //! - `submit` requires an owner and records a `target` contract address
 //!   and an opaque `payload` for cross-contract invocation.
+//! - `submit_call` requires an owner and records a typed cross-contract
+//!   call with `target`, `function`, and `arguments`.
 //! - `confirm` requires an owner that has not confirmed already.
 //! - `reject` requires an owner that has not already signalled on the tx.
 //! - `execute` may be called by anyone; it only succeeds once the threshold is
 //!   met. For opaque-payload txs it performs a real cross-contract
-//!   invocation to the recorded `target`. For typed withdrawal txs it moves
+//!   invocation to the recorded `target`. For typed call txs it invokes
+//!   the specified function with arguments. For typed withdrawal txs it moves
 //!   real tokens.
 //! - A target revert surfaces as [`ForgeError::ContractInvocationFailed`]
 //!   and leaves the transaction un-executed (status stays `Pending`).
+//!
+//! ## Owner-set and threshold governance
+//!
+//! The owner set and approval threshold are themselves governed by the same
+//! machinery: `add_owner`, `remove_owner`, and `set_threshold` each record a
+//! typed pending tx ([`TxKind::AddOwner`], [`TxKind::RemoveOwner`],
+//! [`TxKind::SetThreshold`]) that must cross the **current** threshold
+//! before `execute` applies it. No mutation happens at submission time, and
+//! execution re-validates the resulting owner/threshold state before
+//! writing anything:
+//!
+//! - `add_owner` rejects addresses already in the set at submission and
+//!   again (against the live set) at execution.
+//! - `remove_owner` rejects removal of a non-member or of the final owner at
+//!   submission, and execution additionally refuses a removal that would
+//!   leave `threshold > owners` — the wallet's approval invariant — so a
+//!   valid submission can only fail at execution if the owner set changed
+//!   underneath it.
+//! - `set_threshold` requires `1 <= new_threshold <= owners.len()` at
+//!   submission against the current set and again at execution against the
+//!   resulting set. A threshold-change tx is authorized by the **old**
+//!   threshold, and the new threshold is never retroactively applied to
+//!   in-flight transactions.
+//!
+//! **Removed-owner confirmations are scrubbed.** When a removal executes,
+//! every still-pending tx's confirmation list is rewritten to drop the
+//! removed owner: a former owner's signature must not count towards a
+//! threshold they can no longer be bound by. Only `Pending` txs are
+//! touched, and a tx whose confirmations are all scrubbed simply needs the
+//! surviving threshold anew.
+//!
+//! **Atomicity.** All three mutations validate the resulting state before
+//! writing, and the tx is marked `Executed` only after the mutation
+//! succeeds. A failed execution leaves the tx `Pending` and the wallet
+//! state exactly as it was.
 //!
 //! ## Rejection policy
 //!
@@ -76,10 +119,12 @@
 //! at execution time, not submission time — the balance can change between
 //! the two, so a submitted withdrawal is an intent, not a reservation.
 //!
-//! Two transaction kinds coexist by design:
+//! Three transaction kinds coexist by design:
 //! - **Opaque-payload txs** (`submit`) keep the `payload` `Bytes` untouched
 //!   for arbitrary transaction bodies; dispatching those bytes is out of
 //!   scope here.
+//! - **Typed call txs** (`submit_call`) carry a structured function call
+//!   with target address, function name, and arguments as `Vec<Val>`.
 //! - **Typed withdrawal txs** (`submit_withdrawal`) carry an empty `payload`
 //!   and a [`TxKind::Withdrawal`] record instead. Encoding withdrawals into
 //!   the opaque payload was rejected because the contract would need a
@@ -149,6 +194,15 @@
 //! usage describes the token's withdrawal history, not the policy, and a
 //! later limit is then measured against the withdrawals already in its
 //! window — the conservative direction.
+//!
+//! The read-only views `get_withdrawal_limit`, `get_withdrawal_window`, and
+//! `check_withdrawal` expose the current policy, active usage and projected
+//! expiry, and a simulation of the submission policy plus current funding.
+//! Missing policy/window data (including for an uninitialized wallet or an
+//! unknown token) is represented as `None` or an empty window; the check
+//! reports `WalletNotInitialized` for an uninitialized wallet. These views
+//! do not prune entries or write storage. The limit is enforced at withdrawal
+//! submission as an admission gate, not rechecked when the pending tx executes.
 
 //!
 //! ## Ordering discipline (load-bearing)
@@ -182,9 +236,20 @@
 //! storage would force a full-state restore. Every balance write bumps the
 //! entry's TTL with the standard threshold/extend pattern, and `touch_ttl`
 //! is a permissionless keeper entrypoint for balances that sit idle near
-//! expiry. The `Owners`/`Threshold`/`Count`/`Tx` keys stay in instance
-//! storage: they are small, hot, written by the existing entrypoints, and
-//! their semantics are unchanged by this custody layer.
+//! expiry.
+//!
+//! Transaction records (`DataKey::Tx(tx_id)`) migrated to **persistent
+//! storage** for the same reason: instance storage is byte-budgeted as one
+//! shared entry that every read taxes, while persistent entries scale per
+//! record and carry their own extensible TTL. Every tx write bumps the
+//! entry's TTL with the standard threshold/extend pattern, and
+//! `touch_tx_ttl` is a permissionless keeper entrypoint for long-lived
+//! pending txs that approach expiry. A tx whose TTL lapses is no longer
+//! present — reads return [`ForgeError::NotFound`] and the record cannot be
+//! revived, though the id counter (`DataKey::Count`) is untouched. The
+//! `Owners`/`Threshold`/`Count` keys stay in instance storage: they are
+//! small, hot, written by the existing entrypoints, and their semantics are
+//! unchanged by this storage layer.
 //!
 //! The withdrawal-limit keys follow the same split for the same reasons.
 //! `DataKey::WithdrawalLimit(token)` holds one small policy record, and
@@ -248,6 +313,26 @@ pub trait SorobanForgeMultiSigWallet {
         submitter: Address,
         target: Address,
         tx: Bytes,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Submit a typed cross-contract call as a pending transaction.
+    /// Returns the stable transaction id.
+    ///
+    /// Records a typed [`TxKind::Call`] transaction that invokes
+    /// `target.fn_name(args)` when executed. The call collects owner
+    /// confirmations and executes only past the threshold, like any
+    /// other transaction.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotInitialized`] — the wallet has no owner set.
+    /// * [`ForgeError::Unauthorized`] — `submitter` is not an owner.
+    fn submit_call(
+        env: Env,
+        submitter: Address,
+        target: Address,
+        fn_name: Symbol,
+        args: Vec<Val>,
     ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
 
     /// Record `signer`'s approval of `tx_id`.
@@ -385,6 +470,22 @@ pub trait SorobanForgeMultiSigWallet {
     /// unconstrained.
     fn get_withdrawal_limit(env: Env, token: Address) -> Option<WithdrawalLimit>;
 
+    /// Read the active rolling window for `token` (read-only view).
+    ///
+    /// The start is the oldest active withdrawal's submission time, and
+    /// `reset_at` is that entry's projected expiry. A missing limit, empty
+    /// window, unknown token, or uninitialized wallet reads as an empty
+    /// window with zero total and absent timestamps. This view does not
+    /// prune or otherwise modify storage.
+    fn get_withdrawal_window(env: Env, token: Address) -> WindowState;
+
+    /// Simulate a withdrawal against the current policy and custody balance
+    /// without requiring authorization or modifying storage.
+    ///
+    /// The result reflects the state and ledger timestamp at this call; a
+    /// later submission or execution can differ if either changes.
+    fn check_withdrawal(env: Env, token: Address, amount: i128) -> CheckResult;
+
     /// Read how much of `token` is currently counted against its rolling
     /// window: the total of every withdrawal still inside the window,
     /// pending or executed (read-only view).
@@ -408,6 +509,15 @@ pub trait SorobanForgeMultiSigWallet {
     /// * [`ForgeError::NotFound`] — the wallet holds no balance entry for
     ///   `token`.
     fn touch_ttl(env: Env, token: Address) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Permissionless TTL keeper: bumps the transaction record's TTL for
+    /// `tx_id` to the standard horizon without changing any state.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotFound`] — no transaction record exists (or its TTL
+    ///   has already expired).
+    fn touch_tx_ttl(env: Env, tx_id: u64) -> Result<(), soroban_forge_shared_utils::ForgeError>;
 
     /// Read the current approval threshold (read-only view).
     fn get_threshold(env: Env) -> Result<u32, soroban_forge_shared_utils::ForgeError>;
@@ -470,6 +580,77 @@ pub trait SorobanForgeMultiSigWallet {
 
     /// Read the number of transactions submitted so far (read-only view).
     fn get_tx_count(env: Env) -> u64;
+
+    /// Propose adding `new_owner` to the owner set. Executable only past the
+    /// owner threshold; the actual insertion happens at `execute`, never at
+    /// submission time.
+    ///
+    /// Records a typed [`TxKind::AddOwner`] tx. The submitter must be an
+    /// existing owner, the address must not already be an owner, and the
+    /// resulting owner set must remain non-empty (a no-op add cannot strip
+    /// the wallet to an empty set). Execution re-validates the resulting
+    /// state before mutating anything.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotInitialized`] — the wallet has no owner set.
+    /// * [`ForgeError::Unauthorized`] — `submitter` is not an owner.
+    /// * [`ForgeError::InvalidInput`] — `new_owner` is already an owner.
+    fn add_owner(
+        env: Env,
+        submitter: Address,
+        new_owner: Address,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Propose removing `existing_owner` from the owner set. Executable only
+    /// past the owner threshold; the actual removal happens at `execute`,
+    /// never at submission time.
+    ///
+    /// Records a typed [`TxKind::RemoveOwner`] tx. The submitter must be an
+    /// existing owner and the owner set must never become empty (removing
+    /// the final owner is rejected at submission).
+    ///
+    /// When a removal executes, any pending governance transaction carrying
+    /// a confirmation from the removed owner has that confirmation cleared:
+    /// a former owner's signature must not count towards a threshold they
+    /// can no longer be bound by. See the module docs.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotInitialized`] — the wallet has no owner set.
+    /// * [`ForgeError::Unauthorized`] — `submitter` is not an owner.
+    /// * [`ForgeError::InvalidInput`] — `existing_owner` is not an owner, or
+    ///   is the final owner.
+    fn remove_owner(
+        env: Env,
+        submitter: Address,
+        existing_owner: Address,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
+
+    /// Propose changing the approval threshold to `new_threshold`.
+    /// Executable only past the owner threshold; the change applies at
+    /// `execute`, never at submission time.
+    ///
+    /// Records a typed [`TxKind::SetThreshold`] tx and requires
+    /// `1 <= new_threshold <= owners.len()` against the current owner set
+    /// at submission, re-validated against the resulting state at execution.
+    ///
+    /// A threshold change is authorized by the **old** threshold: the tx
+    /// collects confirmations under the existing threshold, and execution
+    /// only proceeds once that threshold is met. The new threshold is not
+    /// retroactively applied to this or other in-flight transactions.
+    ///
+    /// # Errors
+    ///
+    /// * [`ForgeError::NotInitialized`] — the wallet has no owner set.
+    /// * [`ForgeError::Unauthorized`] — `submitter` is not an owner.
+    /// * [`ForgeError::InvalidInput`] — `new_threshold` is zero or exceeds
+    ///   the owner count.
+    fn set_threshold(
+        env: Env,
+        submitter: Address,
+        new_threshold: u32,
+    ) -> Result<u64, soroban_forge_shared_utils::ForgeError>;
 }
 
 /// Lifecycle state of a submitted transaction.
@@ -489,8 +670,9 @@ pub enum TxStatus {
 /// The kinds encode the custody split documented in the module docs:
 /// opaque-payload transactions dispatch (out of scope here) through their
 /// `payload` bytes, withdrawal transactions move real tokens through the
-/// typed record below, and limit-change transactions retune the per-token
-/// rolling withdrawal cap.
+/// typed record below, limit-change transactions retune the per-token
+/// rolling withdrawal cap, and call transactions dispatch typed
+/// cross-contract invocations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TxKind {
@@ -500,6 +682,27 @@ pub enum TxKind {
     Withdrawal(Withdrawal),
     /// Threshold-gated change to a token's rolling withdrawal limit.
     LimitChange(LimitChange),
+    /// Threshold-gated addition of a new owner.
+    AddOwner(Address),
+    /// Threshold-gated removal of an existing owner.
+    RemoveOwner(Address),
+    /// Threshold-gated change to the approval threshold.
+    SetThreshold(u32),
+    /// Typed cross-contract call.
+    Call(Call),
+}
+
+/// A typed cross-contract call record containing the target address,
+/// function name, and arguments.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Call {
+    /// Target contract address to invoke.
+    pub target: Address,
+    /// Function name to call on the target.
+    pub fn_name: Symbol,
+    /// Arguments to pass to the function.
+    pub args: Vec<Val>,
 }
 
 /// A typed token withdrawal record (see [`TxKind::Withdrawal`] and the
@@ -528,6 +731,51 @@ pub struct WithdrawalLimit {
     pub amount: i128,
     /// Length of the rolling window in seconds; positive.
     pub window_seconds: u64,
+}
+
+/// Read-only snapshot of a token's currently active withdrawal window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowState {
+    /// Total amount in active window entries, including pending withdrawals.
+    pub total: i128,
+    /// Submission time of the oldest active entry, if any.
+    pub window_start: Option<u64>,
+    /// Projected expiry of the oldest active entry, if any.
+    pub reset_at: Option<u64>,
+}
+
+/// Result of simulating a withdrawal against current wallet state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckResult {
+    /// The amount passes the current policy and funding checks.
+    Allowed,
+    /// The wallet has not been initialized.
+    WalletNotInitialized,
+    /// Withdrawal amounts must be positive.
+    InvalidAmount,
+    /// The rolling limit would be exceeded.
+    LimitExceeded,
+    /// The wallet's recorded custody balance is too small.
+    InsufficientFunds,
+    /// Adding the amount to current window usage would overflow `i128`.
+    ArithmeticOverflow,
+}
+
+enum WindowCheckError {
+    LimitExceeded,
+    ArithmeticOverflow,
+}
+
+fn check_window_total(usage: i128, amount: i128, limit: i128) -> Result<(), WindowCheckError> {
+    let total = usage
+        .checked_add(amount)
+        .ok_or(WindowCheckError::ArithmeticOverflow)?;
+    if total > limit {
+        return Err(WindowCheckError::LimitExceeded);
+    }
+    Ok(())
 }
 
 /// A threshold-gated change to a token's withdrawal limit, carried by
@@ -578,27 +826,28 @@ pub struct WalletTx {
 }
 
 /// Storage keys, split by class (see the storage-and-TTL notes in the
-/// module docs). Config and tx records stay in **instance** storage: they
-/// are small, hot, and their semantics predate the custody layer. Token
-/// balances live in **per-token persistent** entries so the byte budget
-/// scales with the number of custodied tokens instead of inflating the
-/// shared instance entry, and so each balance carries its own extensible
-/// TTL — instance storage is the wrong home for anything the wallet
-/// custodies long-term. The per-token withdrawal-limit and window-usage
-/// keys join the balances there for the same reason: both are scoped to one
-/// token and both carry their own TTL.
+/// module docs). Config keys (`Owners`/`Threshold`/`Count`) stay in
+/// **instance** storage: they are small, hot, and their semantics predate
+/// the custody layer. Transaction records live in **per-id persistent**
+/// entries so the byte budget scales with the transaction count instead of
+/// inflating the shared instance entry, and so each record carries its own
+/// extensible TTL — instance storage is the wrong home for tx history that
+/// can grow unbounded. The per-token custody keys join the tx records there
+/// for the same reason: both are scoped to one record/token and both carry
+/// their own TTL.
 #[contracttype]
 enum DataKey {
     // --- instance storage: small, hot, bounded config/state ---
-    /// The transaction record for `u64` id.
-    Tx(u64),
     /// The wallet's owner set.
     Owners,
     /// The approval threshold required to execute.
     Threshold,
     /// Monotonic transaction id counter.
     Count,
-    // --- persistent storage: per-token custody accounting ---
+    // --- persistent storage: per-record tx history and per-token
+    // --- custody accounting ---
+    /// The transaction record for `u64` id.
+    Tx(u64),
     /// The wallet's custody balance of the token at `Address`.
     Balance(Address),
     /// The rolling withdrawal limit for the token at `Address`.
@@ -676,8 +925,48 @@ impl MultiSigWallet {
             kind: TxKind::Opaque,
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(&env, &DataKey::Tx(tx_id));
+        events::submitted(&env, &wallet_tx);
+        Ok(tx_id)
+    }
+
+    /// Submit a typed cross-contract call as a pending transaction.
+    pub fn submit_call(
+        env: Env,
+        submitter: Address,
+        target: Address,
+        fn_name: Symbol,
+        args: Vec<Val>,
+    ) -> Result<u64, ForgeError> {
+        if !Self::is_initialized(&env) {
+            return Err(ForgeError::NotInitialized);
+        }
+        if !Self::is_owner_impl(&env, &submitter) {
+            return Err(ForgeError::Unauthorized);
+        }
+        submitter.require_auth();
+
+        let tx_id = Self::next_id(&env)?;
+        let wallet_tx = WalletTx {
+            tx_id,
+            submitter,
+            target: target.clone(),
+            payload: Bytes::new(&env),
+            confirmations: Vec::new(&env),
+            rejections: Vec::new(&env),
+            status: TxStatus::Pending,
+            kind: TxKind::Call(Call {
+                target,
+                fn_name,
+                args,
+            }),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(&env, &DataKey::Tx(tx_id));
         events::submitted(&env, &wallet_tx);
         Ok(tx_id)
     }
@@ -706,8 +995,9 @@ impl MultiSigWallet {
         }
         wallet_tx.confirmations.push_back(signer);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(&env, &DataKey::Tx(tx_id));
         events::confirmed(&env, &wallet_tx);
         Ok(())
     }
@@ -747,8 +1037,9 @@ impl MultiSigWallet {
             wallet_tx.status = TxStatus::Rejected;
         }
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(&env, &DataKey::Tx(tx_id));
         Ok(())
     }
 
@@ -796,6 +1087,9 @@ impl MultiSigWallet {
         // failure below reverts the whole invocation: balances and tx state
         // stay exactly as they were. Limit-change txs move no tokens: they
         // retune the rolling-window cap once the threshold has approved it.
+        // Owner-set and threshold mutations validate the **resulting** state
+        // first and mutate only when it is valid — a failed mutation leaves
+        // the tx pending and the wallet state untouched.
         match &wallet_tx.kind {
             TxKind::Withdrawal(withdrawal) => {
                 let balance = Self::balance_impl(&env, &withdrawal.token);
@@ -813,6 +1107,19 @@ impl MultiSigWallet {
             TxKind::LimitChange(change) => {
                 Self::apply_limit_change(&env, change);
             }
+            TxKind::AddOwner(new_owner) => {
+                Self::apply_add_owner(&env, new_owner)?;
+            }
+            TxKind::RemoveOwner(existing_owner) => {
+                Self::apply_remove_owner(&env, existing_owner)?;
+                // A former owner's signature must not count towards a
+                // threshold they can no longer be bound by, so every pending
+                // tx's confirmation list is scrubbed of the removed owner.
+                Self::clear_confirmations_of(&env, existing_owner);
+            }
+            TxKind::SetThreshold(new_threshold) => {
+                Self::apply_set_threshold(&env, *new_threshold)?;
+            }
             TxKind::Opaque => {
                 // Opaque-payload txs perform a real cross-contract
                 // invocation. Invoke first, write Executed only on success.
@@ -828,12 +1135,25 @@ impl MultiSigWallet {
                     return Err(ForgeError::ContractInvocationFailed);
                 }
             }
+            TxKind::Call(call) => {
+                // Typed cross-contract call: invoke the specified function
+                // with the provided arguments. Invoke first, write Executed only on success.
+                let result = env.try_invoke_contract::<(), ForgeError>(
+                    &call.target,
+                    &call.fn_name,
+                    call.args.clone(),
+                );
+                if let Err(_) | Ok(Err(_)) = result {
+                    return Err(ForgeError::ContractInvocationFailed);
+                }
+            }
         }
 
         wallet_tx.status = TxStatus::Executed;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(&env, &DataKey::Tx(tx_id));
         events::executed(&env, &wallet_tx);
         Ok(())
     }
@@ -905,8 +1225,9 @@ impl MultiSigWallet {
             }),
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(&env, &DataKey::Tx(tx_id));
         Ok(tx_id)
     }
 
@@ -971,6 +1292,60 @@ impl MultiSigWallet {
         Self::withdrawal_limit_impl(&env, &token)
     }
 
+    /// Read the active rolling window for `token` without pruning storage.
+    pub fn get_withdrawal_window(env: Env, token: Address) -> WindowState {
+        let Some(limit) = Self::withdrawal_limit_impl(&env, &token) else {
+            return WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            };
+        };
+        let now = env.ledger().timestamp();
+        let (entries, total) = Self::pruned_window(&env, &token, limit.window_seconds, now);
+        let mut oldest = None;
+        for i in 0..entries.len() {
+            let entry = entries.get_unchecked(i);
+            oldest = Some(oldest.map_or(entry.submitted_at, |current: u64| {
+                current.min(entry.submitted_at)
+            }));
+        }
+        let reset_at = oldest.map(|start| start.saturating_add(limit.window_seconds));
+        WindowState {
+            total,
+            window_start: oldest,
+            reset_at,
+        }
+    }
+
+    /// Simulate a withdrawal against the current policy and custody balance.
+    pub fn check_withdrawal(env: Env, token: Address, amount: i128) -> CheckResult {
+        if !Self::is_initialized(&env) {
+            return CheckResult::WalletNotInitialized;
+        }
+        if amount <= 0 {
+            return CheckResult::InvalidAmount;
+        }
+
+        if let Some(limit) = Self::withdrawal_limit_impl(&env, &token) {
+            let now = env.ledger().timestamp();
+            let (_entries, usage) = Self::pruned_window(&env, &token, limit.window_seconds, now);
+            let failure = match check_window_total(usage, amount, limit.amount) {
+                Ok(()) => None,
+                Err(WindowCheckError::LimitExceeded) => Some(CheckResult::LimitExceeded),
+                Err(WindowCheckError::ArithmeticOverflow) => Some(CheckResult::ArithmeticOverflow),
+            };
+            if let Some(failure) = failure {
+                return failure;
+            }
+        }
+
+        if Self::balance_impl(&env, &token) < amount {
+            return CheckResult::InsufficientFunds;
+        }
+        CheckResult::Allowed
+    }
+
     /// Read `token`'s current in-window withdrawal total (read-only view).
     ///
     /// Expired entries are excluded. Reads as `0` when no limit is
@@ -995,6 +1370,18 @@ impl MultiSigWallet {
     /// any state (see the trait docs).
     pub fn touch_ttl(env: Env, token: Address) -> Result<(), ForgeError> {
         let key = DataKey::Balance(token);
+        if !env.storage().persistent().has(&key) {
+            return Err(ForgeError::NotFound);
+        }
+        bump_entry(&env, &key);
+        Ok(())
+    }
+
+    /// Permissionless TTL keeper: bump a transaction record's TTL without
+    /// changing confirmations, rejections, status, or any other state (see
+    /// the trait docs).
+    pub fn touch_tx_ttl(env: Env, tx_id: u64) -> Result<(), ForgeError> {
+        let key = DataKey::Tx(tx_id);
         if !env.storage().persistent().has(&key) {
             return Err(ForgeError::NotFound);
         }
@@ -1134,6 +1521,80 @@ impl MultiSigWallet {
         env.storage().instance().get(&DataKey::Count).unwrap_or(0)
     }
 
+    /// Propose adding `new_owner` to the owner set (see the trait docs).
+    ///
+    /// Creates only a pending governance [`TxKind::AddOwner`] tx; the owner
+    /// set is untouched until the threshold-approved `execute` applies it.
+    pub fn add_owner(env: Env, submitter: Address, new_owner: Address) -> Result<u64, ForgeError> {
+        if !Self::is_initialized(&env) {
+            return Err(ForgeError::NotInitialized);
+        }
+        if !Self::is_owner_impl(&env, &submitter) {
+            return Err(ForgeError::Unauthorized);
+        }
+        if Self::is_owner_impl(&env, &new_owner) {
+            return Err(ForgeError::InvalidInput);
+        }
+        submitter.require_auth();
+
+        Self::submit_governance_tx(&env, submitter, TxKind::AddOwner(new_owner))
+    }
+
+    /// Propose removing `existing_owner` from the owner set (see the trait
+    /// docs).
+    ///
+    /// Creates only a pending governance [`TxKind::RemoveOwner`] tx; the
+    /// owner set is untouched until the threshold-approved `execute` applies
+    /// it. Removing the final owner is rejected at submission so a pending
+    /// proposal can never leave the wallet ownerless.
+    pub fn remove_owner(
+        env: Env,
+        submitter: Address,
+        existing_owner: Address,
+    ) -> Result<u64, ForgeError> {
+        if !Self::is_initialized(&env) {
+            return Err(ForgeError::NotInitialized);
+        }
+        if !Self::is_owner_impl(&env, &submitter) {
+            return Err(ForgeError::Unauthorized);
+        }
+        if !Self::is_owner_impl(&env, &existing_owner) {
+            return Err(ForgeError::InvalidInput);
+        }
+        if Self::owner_count(&env) <= 1 {
+            return Err(ForgeError::InvalidInput);
+        }
+        submitter.require_auth();
+
+        Self::submit_governance_tx(&env, submitter, TxKind::RemoveOwner(existing_owner))
+    }
+
+    /// Propose changing the approval threshold to `new_threshold` (see the
+    /// trait docs).
+    ///
+    /// Creates only a pending governance [`TxKind::SetThreshold`] tx. The
+    /// threshold is validated against the current owner set at submission and
+    /// re-validated against the resulting state at execution.
+    pub fn set_threshold(
+        env: Env,
+        submitter: Address,
+        new_threshold: u32,
+    ) -> Result<u64, ForgeError> {
+        if !Self::is_initialized(&env) {
+            return Err(ForgeError::NotInitialized);
+        }
+        if !Self::is_owner_impl(&env, &submitter) {
+            return Err(ForgeError::Unauthorized);
+        }
+        let owner_count = Self::owner_count(&env);
+        if new_threshold == 0 || new_threshold > owner_count {
+            return Err(ForgeError::InvalidInput);
+        }
+        submitter.require_auth();
+
+        Self::submit_governance_tx(&env, submitter, TxKind::SetThreshold(new_threshold))
+    }
+
     /// Credit the custody balance of `token` by `amount`, overflow-safe.
     fn add_balance(env: &Env, token: &Address, amount: i128) -> Result<(), ForgeError> {
         let current: i128 = env
@@ -1201,13 +1662,14 @@ impl MultiSigWallet {
         let now = env.ledger().timestamp();
         let (mut entries, usage) = Self::pruned_window(env, token, limit.window_seconds, now);
 
-        // Checked *before* the comparison, so an overflowing total is
-        // reported rather than wrapping into a value that looks in-limit.
-        let total = usage
-            .checked_add(amount)
-            .ok_or(ForgeError::ArithmeticOverflow)?;
-        if total > limit.amount {
-            return Err(ForgeError::WithdrawalLimitExceeded);
+        match check_window_total(usage, amount, limit.amount) {
+            Ok(()) => {}
+            Err(WindowCheckError::LimitExceeded) => {
+                return Err(ForgeError::WithdrawalLimitExceeded);
+            }
+            Err(WindowCheckError::ArithmeticOverflow) => {
+                return Err(ForgeError::ArithmeticOverflow);
+            }
         }
 
         entries.push_back(WindowEntry {
@@ -1278,8 +1740,9 @@ impl MultiSigWallet {
             kind: TxKind::LimitChange(change),
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(env, &DataKey::Tx(tx_id));
         Ok(tx_id)
     }
 
@@ -1300,6 +1763,165 @@ impl MultiSigWallet {
                 env.storage()
                     .persistent()
                     .remove(&DataKey::WithdrawalLimit(token.clone()));
+            }
+        }
+    }
+
+    /// Open a pending governance tx for one of the owner-set/threshold
+    /// mutations, mirroring `submit_limit_change` so owner-set changes ride
+    /// the same threshold-gated submit -> confirm -> execute machinery
+    /// rather than a second governance path.
+    ///
+    /// The tx carries an empty opaque payload and targets the wallet itself;
+    /// the mutation lives in the typed [`TxKind`] and is applied by the
+    /// threshold-approved `execute`.
+    fn submit_governance_tx(
+        env: &Env,
+        submitter: Address,
+        kind: TxKind,
+    ) -> Result<u64, ForgeError> {
+        let tx_id = Self::next_id(env)?;
+        let wallet_tx = WalletTx {
+            tx_id,
+            submitter,
+            target: env.current_contract_address(),
+            payload: Bytes::new(env),
+            confirmations: Vec::new(env),
+            rejections: Vec::new(env),
+            status: TxStatus::Pending,
+            kind,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Tx(tx_id), &wallet_tx);
+        bump_entry(env, &DataKey::Tx(tx_id));
+        Ok(tx_id)
+    }
+
+    /// Number of owners currently in the owner set.
+    ///
+    /// A wallet that is not yet initialized reads as `0`.
+    fn owner_count(env: &Env) -> u32 {
+        match env
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::Owners)
+        {
+            Some(owners) => owners.len(),
+            None => 0,
+        }
+    }
+
+    /// Apply a threshold-approved owner addition.
+    ///
+    /// Re-validates the resulting state before mutating: the new owner must
+    /// not already be a member. The owner set is written only once the
+    /// result is known to be valid, so a failed validation leaves the
+    /// wallet state untouched and the tx pending.
+    fn apply_add_owner(env: &Env, new_owner: &Address) -> Result<(), ForgeError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Owners)
+            .ok_or(ForgeError::NotInitialized)?;
+        if owners.contains(new_owner) {
+            return Err(ForgeError::InvalidInput);
+        }
+        let mut updated = Vec::new(env);
+        for i in 0..owners.len() {
+            updated.push_back(owners.get_unchecked(i));
+        }
+        updated.push_back(new_owner.clone());
+        env.storage().instance().set(&DataKey::Owners, &updated);
+        Ok(())
+    }
+
+    /// Apply a threshold-approved owner removal.
+    ///
+    /// Re-validates the resulting state before mutating: the removed owner
+    /// must be a member, may not be the final owner, and the surviving owner
+    /// set must still satisfy the current approval threshold. The owner set
+    /// is written only once the result is known to be valid, so a failed
+    /// validation leaves the wallet state untouched and the tx pending.
+    fn apply_remove_owner(env: &Env, existing_owner: &Address) -> Result<(), ForgeError> {
+        let owners: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Owners)
+            .ok_or(ForgeError::NotInitialized)?;
+        if !owners.contains(existing_owner) || owners.len() <= 1 {
+            return Err(ForgeError::InvalidInput);
+        }
+        let mut updated = Vec::new(env);
+        for i in 0..owners.len() {
+            let owner = owners.get_unchecked(i);
+            if owner != *existing_owner {
+                updated.push_back(owner);
+            }
+        }
+        // The wallet's approval invariant is `threshold <= owners`: a
+        // removal that would leave more owners required than remain is a
+        // state the wallet must not enter, so it instead fails here and the
+        // tx stays pending.
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .ok_or(ForgeError::NotInitialized)?;
+        if threshold > updated.len() {
+            return Err(ForgeError::InvalidInput);
+        }
+        env.storage().instance().set(&DataKey::Owners, &updated);
+        Ok(())
+    }
+
+    /// Apply a threshold-approved threshold change.
+    ///
+    /// Re-validates the resulting state (`1 <= new_threshold <= owners`)
+    /// against the owner set *at execution time* before mutating. The
+    /// threshold is written only once the result is known to be valid.
+    fn apply_set_threshold(env: &Env, new_threshold: u32) -> Result<(), ForgeError> {
+        let owners = Self::owner_count(env);
+        if new_threshold == 0 || new_threshold > owners {
+            return Err(ForgeError::InvalidInput);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &new_threshold);
+        Ok(())
+    }
+
+    /// Scrub `removed_owner`'s confirmation from every pending tx.
+    ///
+    /// A former owner's signature must not count towards a threshold they
+    /// can no longer be bound by. Only `Pending` txs are touched, and only
+    /// when they actually carry the removed owner's confirmation.
+    fn clear_confirmations_of(env: &Env, removed_owner: &Address) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&DataKey::Count)
+            .unwrap_or(0);
+        for id in 1..=count {
+            let key = DataKey::Tx(id);
+            let Some(mut wallet_tx) = env.storage().persistent().get::<_, WalletTx>(&key) else {
+                continue;
+            };
+            if wallet_tx.status != TxStatus::Pending {
+                continue;
+            }
+            let before = wallet_tx.confirmations.len();
+            let mut kept = Vec::new(env);
+            for i in 0..wallet_tx.confirmations.len() {
+                let signer = wallet_tx.confirmations.get_unchecked(i);
+                if signer != *removed_owner {
+                    kept.push_back(signer);
+                }
+            }
+            if kept.len() != before {
+                wallet_tx.confirmations = kept;
+                env.storage().persistent().set(&key, &wallet_tx);
+                bump_entry(env, &key);
             }
         }
     }
@@ -1326,7 +1948,7 @@ impl MultiSigWallet {
 
     fn get_tx_impl(env: &Env, tx_id: u64) -> Result<WalletTx, ForgeError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Tx(tx_id))
             .ok_or(ForgeError::NotFound)
     }
@@ -2635,6 +3257,29 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Tx record persistence: TTL keeper
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn touch_tx_ttl_extends_and_keeps_tx_state_intact() {
+        let (_env, client, accounts, _token, _token_client) = custody!();
+        let tx_id = client.submit(&accounts.user1, &accounts.arbiter, &Bytes::new(&_env));
+
+        client.touch_tx_ttl(&tx_id);
+
+        let tx = client.get_tx(&tx_id);
+        assert_eq!(tx.status, TxStatus::Pending);
+        assert_eq!(tx.confirmations.len(), 0);
+    }
+
+    #[test]
+    fn touch_tx_ttl_unknown_tx_is_not_found() {
+        let (_env, client, _accounts, _token, _token_client) = custody!();
+        let err = client.try_touch_tx_ttl(&99).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::NotFound);
+    }
+
+    // -------------------------------------------------------------------
     // Per-token rolling withdrawal limits
     // -------------------------------------------------------------------
 
@@ -2746,6 +3391,191 @@ mod tests {
     }
 
     #[test]
+    fn withdrawal_window_reports_oldest_active_expiry_and_empty_states() {
+        let (env, client, accounts, token, _token_client) = custody!();
+        client.deposit(&token, &accounts.user1, &2_000);
+        let unknown = Address::generate(&env);
+        assert_eq!(
+            client.get_withdrawal_window(&unknown),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+        assert_eq!(client.get_withdrawal_limit(&unknown), None);
+
+        env.ledger().set_timestamp(5_000);
+        limited!(client, accounts, token, 1_000_i128, 1_000_u64);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &300_i128);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 300,
+                window_start: Some(5_000),
+                reset_at: Some(6_000),
+            }
+        );
+
+        env.ledger().set_timestamp(5_999);
+        assert_eq!(client.get_withdrawal_window(&token).total, 300);
+        assert_eq!(
+            client.check_withdrawal(&token, &701),
+            CheckResult::LimitExceeded
+        );
+        env.ledger().set_timestamp(6_000);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+        assert_eq!(
+            client.check_withdrawal(&token, &1_000),
+            CheckResult::Allowed
+        );
+        env.ledger().set_timestamp(6_001);
+        assert_eq!(client.get_withdrawal_window(&token).total, 0);
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &1_000);
+        assert_eq!(client.get_withdrawal_window(&token).total, 1_000);
+    }
+
+    #[test]
+    fn withdrawal_window_is_empty_when_uninitialized_or_limit_removed() {
+        let env = Env::default();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let token = Address::generate(&env);
+        assert_eq!(client.get_withdrawal_limit(&token), None);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+
+        let (_env, client, accounts, token, _token_client) = custody!();
+        limited!(client, accounts, token, 1_000_i128, 3_600_u64);
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &600_i128);
+        let removal = client.remove_withdrawal_limit(&accounts.user1, &token);
+        client.confirm(&removal, &accounts.user2);
+        client.confirm(&removal, &accounts.user3);
+        client.execute(&removal);
+        assert_eq!(client.get_withdrawal_limit(&token), None);
+        assert_eq!(
+            client.get_withdrawal_window(&token),
+            WindowState {
+                total: 0,
+                window_start: None,
+                reset_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn check_withdrawal_matches_submission_policy_without_mutating_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let accounts = TestAccounts::generate(&env);
+        let owners = owner_vec(&env, &accounts);
+        client.initialize(&owners, &2_u32);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let token_admin = StellarAssetClient::new(&env, &token);
+        token_admin.mint(&accounts.user1, &DEPOSIT);
+        client.deposit(&token, &accounts.user1, &DEPOSIT);
+        env.ledger().set_timestamp(7_000);
+        limited!(client, accounts, token, 1_000_i128, 3_600_u64);
+        client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &600_i128);
+
+        let before = env.as_contract(&contract_id, || {
+            (
+                env.storage()
+                    .persistent()
+                    .get::<_, Vec<WindowEntry>>(&DataKey::WindowUsage(token.clone())),
+                env.storage()
+                    .persistent()
+                    .get::<_, WithdrawalLimit>(&DataKey::WithdrawalLimit(token.clone())),
+                env.storage().instance().get::<_, u64>(&DataKey::Count),
+            )
+        });
+        assert_eq!(
+            client.get_withdrawal_limit(&token).unwrap(),
+            WithdrawalLimit {
+                token: token.clone(),
+                amount: 1_000,
+                window_seconds: 3_600,
+            }
+        );
+        assert_eq!(client.get_withdrawal_window(&token).total, 600);
+        assert_eq!(client.get_window_usage(&token), 600);
+        assert_eq!(client.check_withdrawal(&token, &400), CheckResult::Allowed);
+        assert_eq!(
+            client.check_withdrawal(&token, &401),
+            CheckResult::LimitExceeded
+        );
+        assert_eq!(
+            client.check_withdrawal(&token, &-1),
+            CheckResult::InvalidAmount
+        );
+        assert_eq!(
+            client.check_withdrawal(&Address::generate(&env), &1),
+            CheckResult::InsufficientFunds
+        );
+        let after = env.as_contract(&contract_id, || {
+            (
+                env.storage()
+                    .persistent()
+                    .get::<_, Vec<WindowEntry>>(&DataKey::WindowUsage(token.clone())),
+                env.storage()
+                    .persistent()
+                    .get::<_, WithdrawalLimit>(&DataKey::WithdrawalLimit(token.clone())),
+                env.storage().instance().get::<_, u64>(&DataKey::Count),
+            )
+        });
+        assert_eq!(before, after);
+
+        // Simulation predicts the next submission one second later:
+        // 600 + 400 fits, while 600 + 401 returns the enforcement error.
+        env.ledger().set_timestamp(7_001);
+        let admitted = client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &400);
+        assert_eq!(client.get_tx(&admitted).status, TxStatus::Pending);
+        let err = client
+            .try_submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &1_i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::WithdrawalLimitExceeded);
+    }
+
+    #[test]
+    fn check_withdrawal_reports_uninitialized_wallet() {
+        let env = Env::default();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let token = Address::generate(&env);
+        assert_eq!(
+            client.check_withdrawal(&token, &1),
+            CheckResult::WalletNotInitialized
+        );
+    }
+
+    #[test]
     fn pending_and_executed_withdrawals_both_occupy_the_window() {
         let (env, client, accounts, token, _token_client) = custody!();
         client.deposit(&token, &accounts.user1, &10_000);
@@ -2807,6 +3637,10 @@ mod tests {
 
         client.submit_withdrawal(&accounts.user1, &token, &accounts.arbiter, &i128::MAX);
         assert_eq!(client.get_window_usage(&token), i128::MAX);
+        assert_eq!(
+            client.check_withdrawal(&token, &1),
+            CheckResult::ArithmeticOverflow
+        );
 
         // i128::MAX + 1 is not representable. The checked total surfaces it
         // instead of wrapping to i128::MIN, which would read as in-limit.
@@ -3095,5 +3929,387 @@ mod tests {
         // The views stay readable on an uninitialized wallet.
         assert_eq!(client.get_withdrawal_limit(&token), None);
         assert_eq!(client.get_window_usage(&token), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Owner-set and threshold governance (add_owner / remove_owner /
+    // set_threshold)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn add_owner_is_threshold_gated_and_partial_threshold_has_no_effect() {
+        let (env, client, accounts) = setup!();
+        let newbie = Address::generate(&env);
+
+        // Submission creates only a pending typed tx: the owner set is
+        // untouched.
+        let tx = client.add_owner(&accounts.user1, &newbie);
+        assert_eq!(client.get_tx_count(), 1);
+        assert_eq!(client.get_tx(&tx).kind, TxKind::AddOwner(newbie.clone()));
+        assert!(!client.is_owner(&newbie));
+        assert_eq!(client.get_owners().len(), 3);
+
+        // One signature short of threshold 2: no effect and no execution.
+        client.confirm(&tx, &accounts.user2);
+        let err = client.try_execute(&tx).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert!(!client.is_owner(&newbie));
+        assert_eq!(client.get_tx(&tx).status, TxStatus::Pending);
+
+        // Threshold met: permissionless execute applies the add.
+        client.confirm(&tx, &accounts.user3);
+        client.execute(&tx);
+        assert!(client.is_owner(&newbie));
+        assert_eq!(client.get_tx(&tx).status, TxStatus::Executed);
+    }
+
+    #[test]
+    fn add_owner_duplicate_is_invalid_and_non_owner_cannot_submit() {
+        let (env, client, accounts) = setup!();
+        let newbie = Address::generate(&env);
+
+        let err = client
+            .try_add_owner(&accounts.user1, &accounts.user2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+
+        let err = client
+            .try_add_owner(&accounts.arbiter, &newbie)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::Unauthorized);
+        assert_eq!(client.get_tx_count(), 0);
+    }
+
+    #[test]
+    fn remove_owner_is_threshold_gated() {
+        let (_env, client, accounts) = setup!();
+
+        let tx = client.remove_owner(&accounts.user1, &accounts.user3);
+        assert_eq!(
+            client.get_tx(&tx).kind,
+            TxKind::RemoveOwner(accounts.user3.clone())
+        );
+        // Pending only: the owner set is unchanged at submission time.
+        assert!(client.is_owner(&accounts.user3));
+        assert_eq!(client.get_owners().len(), 3);
+
+        client.confirm(&tx, &accounts.user2);
+        let err = client.try_execute(&tx).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert!(client.is_owner(&accounts.user3));
+
+        client.confirm(&tx, &accounts.user1);
+        client.execute(&tx);
+        assert!(!client.is_owner(&accounts.user3));
+        assert_eq!(client.get_owners().len(), 2);
+        assert_eq!(client.get_tx(&tx).status, TxStatus::Executed);
+    }
+
+    #[test]
+    fn remove_owner_rejects_final_owner_and_non_member() {
+        let (_env, client, accounts) = setup!();
+
+        let err = client
+            .try_remove_owner(&accounts.user1, &accounts.arbiter)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+
+        // A two-owner wallet: removing the second owner would leave a
+        // single owner behind, but this wallet starts at three, so build
+        // the one-removal-from-final case directly.
+        let tx = client.remove_owner(&accounts.user1, &accounts.user3);
+        client.confirm(&tx, &accounts.user2);
+        client.confirm(&tx, &accounts.user1);
+        client.execute(&tx);
+        assert_eq!(client.get_owners().len(), 2);
+
+        // The final-owner guard is exercised on a single-owner wallet
+        // (threshold 1): removing the only member is rejected at
+        // submission, and the owner set stays intact.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MultiSigWallet, ());
+        let solo = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let accounts_solo = TestAccounts::generate(&env);
+        let solo_owners = soroban_sdk::vec![&env, accounts_solo.user1.clone()];
+        solo.initialize(&solo_owners, &1_u32);
+
+        let err = solo
+            .try_remove_owner(&accounts_solo.user1, &accounts_solo.user1)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert_eq!(solo.get_owners().len(), 1);
+        assert!(solo.is_owner(&accounts_solo.user1));
+    }
+
+    #[test]
+    fn execution_refuses_removal_that_would_break_the_threshold() {
+        // A three-owner wallet with a threshold of 3: removing anyone
+        // leaves 2 owners, which cannot satisfy the 3-owner threshold.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let accounts = TestAccounts::generate(&env);
+        client.initialize(&owner_vec(&env, &accounts), &3_u32);
+
+        let tx = client.remove_owner(&accounts.user1, &accounts.user3);
+        client.confirm(&tx, &accounts.user2);
+        client.confirm(&tx, &accounts.user1);
+        client.confirm(&tx, &accounts.user3);
+
+        // The submission was valid (3 owners, >1), but execution
+        // re-validates the resulting state and refuses: 2 owners cannot
+        // satisfy threshold 3. The tx stays pending and the owner set is
+        // untouched.
+        let err = client.try_execute(&tx).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert_eq!(client.get_tx(&tx).status, TxStatus::Pending);
+        assert_eq!(client.get_owners().len(), 3);
+        assert!(client.is_owner(&accounts.user3));
+        assert_eq!(client.get_threshold(), 3_u32);
+    }
+
+    #[test]
+    fn set_threshold_is_threshold_gated_by_the_old_threshold() {
+        let (env, client, accounts) = setup!();
+
+        let tx = client.set_threshold(&accounts.user1, &3_u32);
+        assert_eq!(client.get_tx(&tx).kind, TxKind::SetThreshold(3));
+        // Pending only: the configured threshold is unchanged.
+        assert_eq!(client.get_threshold(), 2_u32);
+
+        client.confirm(&tx, &accounts.user2);
+        let err = client.try_execute(&tx).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert_eq!(client.get_threshold(), 2_u32);
+
+        // The old threshold (2) authorizes the change; once it executes
+        // the new threshold (3) governs the wallet.
+        client.confirm(&tx, &accounts.user3);
+        client.execute(&tx);
+        assert_eq!(client.get_threshold(), 3_u32);
+
+        // New proposals now need three confirmations.
+        let newbie = Address::generate(&env);
+        let next = client.add_owner(&accounts.user1, &newbie);
+        client.confirm(&next, &accounts.user2);
+        client.confirm(&next, &accounts.user3);
+        let err = client.try_execute(&next).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert!(!client.is_owner(&newbie));
+
+        client.confirm(&next, &accounts.user1);
+        client.execute(&next);
+        assert!(client.is_owner(&newbie));
+    }
+
+    #[test]
+    fn set_threshold_validates_against_current_owners() {
+        let (_env, client, accounts) = setup!();
+
+        let err = client
+            .try_set_threshold(&accounts.user1, &0_u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+
+        let err = client
+            .try_set_threshold(&accounts.user1, &4_u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        assert_eq!(client.get_threshold(), 2_u32);
+    }
+
+    #[test]
+    fn governance_tx_cannot_execute_twice() {
+        let (env, client, accounts) = setup!();
+        let newbie = Address::generate(&env);
+
+        let tx = client.add_owner(&accounts.user1, &newbie);
+        client.confirm(&tx, &accounts.user2);
+        client.confirm(&tx, &accounts.user3);
+        client.execute(&tx);
+        assert_eq!(client.get_tx(&tx).status, TxStatus::Executed);
+
+        let err = client.try_execute(&tx).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+    }
+
+    #[test]
+    fn failed_execution_leaves_tx_pending_and_state_untouched() {
+        let (env, client, accounts) = setup!();
+        let newbie = Address::generate(&env);
+
+        // Two identical proposals race: the second can only apply once the
+        // first has already inserted the owner, so its execution fails.
+        let tx1 = client.add_owner(&accounts.user1, &newbie);
+        let tx2 = client.add_owner(&accounts.user2, &newbie);
+        client.confirm(&tx1, &accounts.user2);
+        client.confirm(&tx1, &accounts.user3);
+        client.execute(&tx1);
+        assert!(client.is_owner(&newbie));
+
+        client.confirm(&tx2, &accounts.user1);
+        client.confirm(&tx2, &accounts.user3);
+        let err = client.try_execute(&tx2).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+        // The failed tx is still pending and the wallet state is exactly
+        // what tx1 produced.
+        assert_eq!(client.get_tx(&tx2).status, TxStatus::Pending);
+        assert_eq!(client.get_owners().len(), 4);
+        assert!(client.is_owner(&newbie));
+    }
+
+    #[test]
+    fn removal_clears_confirmations_from_pending_txs() {
+        let (env, client, accounts) = setup!();
+        let newbie = Address::generate(&env);
+
+        // user1 confirms an add-owner proposal...
+        let add_tx = client.add_owner(&accounts.user1, &newbie);
+        client.confirm(&add_tx, &accounts.user1);
+        assert_eq!(client.get_confirmations(&add_tx).len(), 1);
+
+        // ...then user1 is removed through a separate threshold-approved tx.
+        let remove_tx = client.remove_owner(&accounts.user2, &accounts.user1);
+        client.confirm(&remove_tx, &accounts.user3);
+        client.confirm(&remove_tx, &accounts.user2);
+        client.execute(&remove_tx);
+        assert!(!client.is_owner(&accounts.user1));
+
+        // user1's signature no longer counts towards the add proposal: it
+        // can no longer reach the threshold of 2 on its own.
+        assert!(!client.get_confirmations(&add_tx).contains(&accounts.user1));
+        let err = client.try_execute(&add_tx).unwrap_err().unwrap();
+        assert_eq!(err, ForgeError::InvalidInput);
+
+        // Two surviving owners can still approve it.
+        client.confirm(&add_tx, &accounts.user2);
+        client.confirm(&add_tx, &accounts.user3);
+        client.execute(&add_tx);
+        assert!(client.is_owner(&newbie));
+    }
+
+    #[test]
+    fn governance_tx_ids_share_the_submission_counter() {
+        let (env, client, accounts) = setup!();
+
+        assert_eq!(
+            client.submit(&accounts.user1, &target(&env), &payload(&env)),
+            1
+        );
+        assert_eq!(
+            client.add_owner(&accounts.user2, &Address::generate(&env)),
+            2
+        );
+        assert_eq!(client.set_threshold(&accounts.user3, &3_u32), 3);
+        assert_eq!(client.remove_owner(&accounts.user1, &accounts.user2), 4);
+        assert_eq!(client.get_tx_count(), 4);
+    }
+
+    #[test]
+    fn governance_entrypoints_before_initialize_are_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+        let accounts = TestAccounts::generate(&env);
+        let newbie = Address::generate(&env);
+
+        let err = client
+            .try_add_owner(&accounts.user1, &newbie)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::NotInitialized);
+
+        let err = client
+            .try_remove_owner(&accounts.user1, &accounts.user2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::NotInitialized);
+
+        let err = client
+            .try_set_threshold(&accounts.user1, &1_u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::NotInitialized);
+    }
+}
+
+// Tests for the new submit_call functionality
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+    use soroban_forge_test_utils::{new_env, TestAccounts};
+    use soroban_sdk::{symbol_short, vec, Val};
+
+    #[test]
+    fn submit_call_basic() {
+        let env = new_env();
+        let accounts = TestAccounts::generate(&env);
+
+        // Deploy contract
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+
+        // Initialize with simple 1-of-2 setup for testing
+        let owners = vec![&env, accounts.user1.clone(), accounts.user2.clone()];
+        client.initialize(&owners, &1);
+
+        // Submit a call transaction
+        let target = accounts.deployer.clone(); // Dummy target
+        let fn_name = symbol_short!("test");
+        let args: Vec<Val> = vec![&env, Val::from_u32(42).into()];
+
+        let tx_id = client.submit_call(&accounts.user1, &target, &fn_name, &args);
+        assert_eq!(tx_id, 1);
+
+        // Verify transaction was stored correctly
+        let tx = client.get_tx(&tx_id);
+        assert_eq!(tx.tx_id, tx_id);
+        assert_eq!(tx.submitter, accounts.user1);
+        assert_eq!(tx.target, target);
+        assert_eq!(tx.status, TxStatus::Pending);
+
+        // Verify it's a Call transaction
+        match tx.kind {
+            TxKind::Call(call) => {
+                assert_eq!(call.target, target);
+                assert_eq!(call.fn_name, fn_name);
+                assert_eq!(call.args.len(), 1);
+            }
+            _ => panic!("Expected Call transaction"),
+        }
+    }
+
+    #[test]
+    fn submit_call_requires_owner() {
+        let env = new_env();
+        let accounts = TestAccounts::generate(&env);
+
+        // Deploy contract
+        let contract_id = env.register(MultiSigWallet, ());
+        let client = SorobanForgeMultiSigWalletClient::new(&env, &contract_id);
+
+        // Initialize with owners
+        let owners = vec![&env, accounts.user1.clone(), accounts.user2.clone()];
+        client.initialize(&owners, &1);
+
+        // Try to submit as non-owner
+        let target = accounts.deployer.clone();
+        let fn_name = symbol_short!("test");
+        let args: Vec<Val> = vec![&env];
+
+        let err = client
+            .try_submit_call(&accounts.user3, &target, &fn_name, &args)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ForgeError::Unauthorized);
     }
 }
