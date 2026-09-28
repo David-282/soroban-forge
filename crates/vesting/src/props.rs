@@ -25,7 +25,7 @@
 //  **P4 — Tamper-Resilient Conservation.** An attacker attempting to mutate stored
 //  schedule parameters (amount, claimed, start, cliff, duration) between calls can
 //  never move value out of the pool beyond the token contract's balance.
- 
+
 //   Runs are deterministic with reproducible seeds. Override the case count with
 //   `PROPTEST_CASES=n cargo test -p soroban-forge-vesting props`.
 
@@ -376,9 +376,8 @@ use crate::MAX_TRANCHES;
 
 #[test]
 fn props_tranche_conservation_and_monotonicity() {
-    let mut runner = proptest::test_runner::TestRunner::new(
-        proptest::test_runner::Config::with_cases(256),
-    );
+    let mut runner =
+        proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(256));
 
     runner
         .run(
@@ -408,7 +407,13 @@ fn props_tranche_conservation_and_monotonicity() {
                 let id = client.create_tranche_schedule(&w.beneficiary, &w.token, &tranches);
 
                 let mut prev_claimable = 0i128;
-                for t_advance in [0u64, current_offset / 4, current_offset / 2, current_offset, current_offset * 2] {
+                for t_advance in [
+                    0u64,
+                    current_offset / 4,
+                    current_offset / 2,
+                    current_offset,
+                    current_offset * 2,
+                ] {
                     env.ledger().set_timestamp(START.saturating_add(t_advance));
                     let c = client.claimable(&id);
                     assert!(c >= prev_claimable);
@@ -416,7 +421,8 @@ fn props_tranche_conservation_and_monotonicity() {
                     prev_claimable = c;
                 }
 
-                env.ledger().set_timestamp(START.saturating_add(current_offset.saturating_mul(2)));
+                env.ledger()
+                    .set_timestamp(START.saturating_add(current_offset.saturating_mul(2)));
                 let claimed = client.claim(&id);
                 assert_eq!(claimed, total_expected_amount);
                 assert_eq!(client.get_status(&id), VestingStatus::Completed);

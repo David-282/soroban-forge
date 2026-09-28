@@ -573,7 +573,6 @@ fn monotonic_id_counter_overflow_reported() {
     assert_eq!(err, ForgeError::ArithmeticOverflow);
 }
 
-
 // --- Tranche Vesting Validation & Unit Tests ---
 
 #[test]
@@ -628,14 +627,26 @@ fn create_tranche_schedule_rejects_non_increasing_offsets() {
     let beneficiary = Address::generate(&env);
 
     let mut equal_offsets = soroban_sdk::Vec::new(&env);
-    equal_offsets.push_back(Tranche { unlock_at: 100, amount: 500 });
-    equal_offsets.push_back(Tranche { unlock_at: 100, amount: 500 });
+    equal_offsets.push_back(Tranche {
+        unlock_at: 100,
+        amount: 500,
+    });
+    equal_offsets.push_back(Tranche {
+        unlock_at: 100,
+        amount: 500,
+    });
     let res = client.try_create_tranche_schedule(&beneficiary, &token.address, &equal_offsets);
     assert_eq!(res.unwrap_err().unwrap(), ForgeError::InvalidInput);
 
     let mut decreasing = soroban_sdk::Vec::new(&env);
-    decreasing.push_back(Tranche { unlock_at: 200, amount: 500 });
-    decreasing.push_back(Tranche { unlock_at: 100, amount: 500 });
+    decreasing.push_back(Tranche {
+        unlock_at: 200,
+        amount: 500,
+    });
+    decreasing.push_back(Tranche {
+        unlock_at: 100,
+        amount: 500,
+    });
     let res2 = client.try_create_tranche_schedule(&beneficiary, &token.address, &decreasing);
     assert_eq!(res2.unwrap_err().unwrap(), ForgeError::InvalidInput);
 }
@@ -667,8 +678,14 @@ fn tranche_tge_and_max_u64_behavior() {
     let beneficiary = Address::generate(&env);
 
     let mut tranches = soroban_sdk::Vec::new(&env);
-    tranches.push_back(Tranche { unlock_at: 0, amount: 1_000 });
-    tranches.push_back(Tranche { unlock_at: u64::MAX, amount: 9_000 });
+    tranches.push_back(Tranche {
+        unlock_at: 0,
+        amount: 1_000,
+    });
+    tranches.push_back(Tranche {
+        unlock_at: u64::MAX,
+        amount: 9_000,
+    });
 
     let id = client.create_tranche_schedule(&beneficiary, &token.address, &tranches);
 
@@ -686,8 +703,14 @@ fn tranche_claim_step_function_and_settlement() {
     let beneficiary = Address::generate(&env);
 
     let mut tranches = soroban_sdk::Vec::new(&env);
-    tranches.push_back(Tranche { unlock_at: 100, amount: 2_000 });
-    tranches.push_back(Tranche { unlock_at: 200, amount: 3_000 });
+    tranches.push_back(Tranche {
+        unlock_at: 100,
+        amount: 2_000,
+    });
+    tranches.push_back(Tranche {
+        unlock_at: 200,
+        amount: 3_000,
+    });
 
     let id = client.create_tranche_schedule(&beneficiary, &token.address, &tranches);
 
@@ -721,16 +744,13 @@ fn linear_and_tranche_coexistence() {
     let beneficiary1 = Address::generate(&env);
     let beneficiary2 = Address::generate(&env);
 
-    let id_linear = client.create_schedule(
-        &beneficiary1,
-        &token.address,
-        &10_000,
-        &100,
-        &200,
-    );
+    let id_linear = client.create_schedule(&beneficiary1, &token.address, &10_000, &100, &200);
 
     let mut tranches = soroban_sdk::Vec::new(&env);
-    tranches.push_back(Tranche { unlock_at: 100, amount: 5_000 });
+    tranches.push_back(Tranche {
+        unlock_at: 100,
+        amount: 5_000,
+    });
     let id_tranche = client.create_tranche_schedule(&beneficiary2, &token.address, &tranches);
 
     assert_ne!(id_linear, id_tranche);
