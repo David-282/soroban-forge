@@ -101,7 +101,7 @@ fn set_royalty_rejects_signature_from_non_collection() {
 
 #[test]
 fn distribute_accepts_collection_signature() {
-    let (env, _token, contract_id, client, collection, recipient, seller, _payer) = setup!();
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
 
     client.set_royalty(&collection, &recipient, &BPS);
 
@@ -124,7 +124,7 @@ fn distribute_accepts_collection_signature() {
 
 #[test]
 fn distribute_rejects_seller_signature() {
-    let (env, _token, contract_id, client, collection, recipient, seller, _payer) = setup!();
+    let (env, token, contract_id, client, collection, recipient, seller, payer) = setup!();
 
     client.set_royalty(&collection, &recipient, &BPS);
 
@@ -134,12 +134,12 @@ fn distribute_rejects_seller_signature() {
         invoke: &MockAuthInvoke {
             contract: &contract_id,
             fn_name: "distribute",
-            args: (&collection, &seller, AMOUNT).into_val(&env),
+            args: (&collection, &token, &payer, &seller, AMOUNT).into_val(&env),
             sub_invokes: &[],
         },
     }]);
 
-    let res = client.try_distribute(&collection, &seller, &AMOUNT);
+    let res = client.try_distribute(&collection, &token, &payer, &seller, &AMOUNT);
     assert_auth_abort!(res);
 }
 
