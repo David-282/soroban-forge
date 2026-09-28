@@ -696,7 +696,6 @@ fn tranche_tge_and_max_u64_behavior() {
 }
 
 #[test]
-#[test]
 fn tranche_claim_step_function_and_settlement() {
     let (env, _, token, _, client, _) = setup!();
     env.mock_all_auths();

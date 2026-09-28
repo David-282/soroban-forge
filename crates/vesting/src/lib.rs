@@ -102,7 +102,6 @@ use soroban_sdk::{contract, contractclient, contractimpl, contracttype, token, A
 /// claim. Creation rejects a longer table with [`ForgeError::InvalidInput`]
 /// rather than truncating it. The cap is deliberately generous relative to
 /// real agreements; raise it only with a reason.
-
 pub const MAX_TRANCHES: u32 = 32;
 
 /// Public interface for the Soroban Forge vesting contract.
