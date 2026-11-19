@@ -155,7 +155,7 @@
 #[cfg(test)]
 extern crate std;
 
-use soroban_forge_shared_utils::ForgeError;
+use soroban_forge_shared_utils::{bump_entry, ForgeError};
 use soroban_sdk::{contract, contractclient, contractimpl, contracttype, token, Address, Env, Vec};
 
 /// Maximum number of tranches a single schedule may carry.
@@ -325,6 +325,16 @@ pub trait SorobanForgeVesting {
         env: Env,
         schedule_id: u64,
     ) -> Result<VestingStatus, soroban_forge_shared_utils::ForgeError>;
+
+    /// Permissionless TTL keeper: extends the persistent storage TTL for an
+    /// existing schedule without mutating any vesting or accounting state.
+    fn touch_ttl(env: Env, schedule_id: u64) -> Result<(), soroban_forge_shared_utils::ForgeError>;
+
+    /// Inspect the remaining ledger TTL for a schedule in persistent storage.
+    fn get_schedule_ttl(
+        env: Env,
+        schedule_id: u64,
+    ) -> Result<u32, soroban_forge_shared_utils::ForgeError>;
 }
 
 /// Lifecycle state of a vesting schedule.
@@ -434,6 +444,12 @@ enum DataKey {
     Count,
     /// Frozen, unclaimed amount owed to a former beneficiary.
     FormerBeneficiaryClaim(u64, Address),
+    /// Versioned (v1) persistent linear vesting record for `u64` id.
+    LinearScheduleV1(u64),
+    /// Versioned (v1) persistent tranche vesting record for `u64` id.
+    TrancheScheduleV1(u64),
+    /// Versioned (v1) persistent frozen balance owed to a former beneficiary.
+    FormerBeneficiaryClaimV1(u64, Address),
 }
 
 /// A stored schedule of either kind, as returned by [`Vesting::load`].
@@ -499,9 +515,7 @@ impl Vesting {
         };
         // Derive the initial status from time (cliff == 0 starts `Vesting`).
         schedule.status = Self::current_status(&schedule, start)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::Schedule(id), &schedule);
+        Self::save_linear(&env, id, &schedule);
         Ok(id)
     }
 
@@ -539,9 +553,7 @@ impl Vesting {
         // Derive the initial status from time (a table starting at 0 begins
         // `Vesting`, mirroring the linear `cliff == 0` case).
         schedule.status = Self::tranche_status(&schedule, start)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::TrancheSchedule(id), &schedule);
+        Self::save_tranche(&env, id, &schedule);
         Ok(id)
     }
 
@@ -564,11 +576,8 @@ impl Vesting {
     /// * [`ForgeError::Unauthorized`] — the funder authorization is missing
     ///   or invalid (a non-funder caller is rejected at the host).
     pub fn revoke(env: Env, schedule_id: u64) -> Result<(), ForgeError> {
-        let mut schedule: VestingSchedule = env
-            .storage()
-            .instance()
-            .get(&DataKey::Schedule(schedule_id))
-            .ok_or(ForgeError::NotFound)?;
+        let mut schedule: VestingSchedule =
+            Self::load_linear(&env, schedule_id)?.ok_or(ForgeError::NotFound)?;
         schedule.funder.require_auth();
         match schedule.status {
             VestingStatus::Completed | VestingStatus::Revoked => Err(ForgeError::InvalidInput),
@@ -576,9 +585,7 @@ impl Vesting {
                 let now = env.ledger().timestamp();
                 schedule.revoked_vested = Some(Self::vested_amount(&schedule, now)?);
                 schedule.status = VestingStatus::Revoked;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Schedule(schedule_id), &schedule);
+                Self::save_linear(&env, schedule_id, &schedule);
                 Ok(())
             }
         }
@@ -601,11 +608,8 @@ impl Vesting {
         schedule_id: u64,
         new_beneficiary: Address,
     ) -> Result<(), ForgeError> {
-        let mut schedule: VestingSchedule = env
-            .storage()
-            .instance()
-            .get(&DataKey::Schedule(schedule_id))
-            .ok_or(ForgeError::NotFound)?;
+        let mut schedule: VestingSchedule =
+            Self::load_linear(&env, schedule_id)?.ok_or(ForgeError::NotFound)?;
         if schedule.revoked_vested.is_some() || schedule.claimed >= schedule.total_amount {
             return Err(ForgeError::InvalidInput);
         }
@@ -624,8 +628,7 @@ impl Vesting {
             .reassignment_count
             .checked_add(1)
             .ok_or(ForgeError::ArithmeticOverflow)?;
-        let old_key = DataKey::FormerBeneficiaryClaim(schedule_id, schedule.beneficiary.clone());
-        let prior_balance: i128 = env.storage().instance().get(&old_key).unwrap_or(0);
+        let prior_balance = Self::load_former_claim(&env, schedule_id, &schedule.beneficiary);
         let old_balance = prior_balance
             .checked_add(old_entitlement)
             .ok_or(ForgeError::ArithmeticOverflow)?;
@@ -639,15 +642,13 @@ impl Vesting {
             reassignment_count,
         );
         if old_balance > 0 {
-            env.storage().instance().set(&old_key, &old_balance);
+            Self::save_former_claim(&env, schedule_id, &schedule.beneficiary, old_balance);
         }
         schedule.beneficiary = new_beneficiary;
         schedule.reassignment_vested = vested;
         schedule.beneficiary_claimed = 0;
         schedule.reassignment_count = reassignment_count;
-        env.storage()
-            .instance()
-            .set(&DataKey::Schedule(schedule_id), &schedule);
+        Self::save_linear(&env, schedule_id, &schedule);
         Ok(())
     }
 
@@ -657,19 +658,13 @@ impl Vesting {
     /// Mirrors `get_tranche_schedule`: the stored record, unchanged. A
     /// tranche id is `NotFound` here; use `get_tranche_schedule` for those.
     pub fn get_schedule(env: Env, schedule_id: u64) -> Result<VestingSchedule, ForgeError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Schedule(schedule_id))
-            .ok_or(ForgeError::NotFound)
+        Self::load_linear(&env, schedule_id)?.ok_or(ForgeError::NotFound)
     }
 
     /// Read the full tranche schedule record, unlock table included
     /// (read-only view; no state change).
     pub fn get_tranche_schedule(env: Env, schedule_id: u64) -> Result<TrancheSchedule, ForgeError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::TrancheSchedule(schedule_id))
-            .ok_or(ForgeError::NotFound)
+        Self::load_tranche(&env, schedule_id)?.ok_or(ForgeError::NotFound)
     }
 
     /// Claim the vested-but-unclaimed amount.
@@ -757,6 +752,114 @@ impl Vesting {
             Stored::Tranche(schedule) => Self::tranche_status(&schedule, now),
         }
     }
+    /// Extend the persistent TTL of a linear or tranche schedule without mutating state.
+    /// Note: Missing records return [`ForgeError::NotFound`]; archived/evicted entries require footprint restoration.
+    pub fn touch_ttl(env: Env, schedule_id: u64) -> Result<(), ForgeError> {
+        let linear_key = DataKey::LinearScheduleV1(schedule_id);
+        if env.storage().persistent().has(&linear_key) {
+            bump_entry(&env, &linear_key);
+            return Ok(());
+        }
+        let tranche_key = DataKey::TrancheScheduleV1(schedule_id);
+        if env.storage().persistent().has(&tranche_key) {
+            bump_entry(&env, &tranche_key);
+            return Ok(());
+        }
+        Err(ForgeError::NotFound)
+    }
+    /// Return remaining persistent TTL (in ledgers) for a schedule, or [`ForgeError::NotFound`] if absent/evicted.
+    pub fn get_schedule_ttl(env: Env, schedule_id: u64) -> Result<u32, ForgeError> {
+        let linear_key = DataKey::LinearScheduleV1(schedule_id);
+        let tranche_key = DataKey::TrancheScheduleV1(schedule_id);
+        if !env.storage().persistent().has(&linear_key)
+            && !env.storage().persistent().has(&tranche_key)
+        {
+            return Err(ForgeError::NotFound);
+        }
+        #[cfg(test)]
+        {
+            use soroban_sdk::testutils::storage::Persistent as _;
+            if env.storage().persistent().has(&linear_key) {
+                return Ok(env.storage().persistent().get_ttl(&linear_key));
+            }
+            Ok(env.storage().persistent().get_ttl(&tranche_key))
+        }
+        #[cfg(not(test))]
+        {
+            Err(ForgeError::Custom)
+        }
+    }
+
+    fn load_linear(env: &Env, schedule_id: u64) -> Result<Option<VestingSchedule>, ForgeError> {
+        let v1_key = DataKey::LinearScheduleV1(schedule_id);
+        if let Some(schedule) = env.storage().persistent().get(&v1_key) {
+            return Ok(Some(schedule));
+        }
+        let legacy_key = DataKey::Schedule(schedule_id);
+        if let Some(schedule) = env.storage().instance().get(&legacy_key) {
+            return Ok(Some(schedule));
+        }
+        Ok(None)
+    }
+
+    /// Load a tranche schedule from persistent `V1` storage, falling back to
+    /// legacy `instance` storage for backward compatibility.
+    fn load_tranche(env: &Env, schedule_id: u64) -> Result<Option<TrancheSchedule>, ForgeError> {
+        let v1_key = DataKey::TrancheScheduleV1(schedule_id);
+        if let Some(schedule) = env.storage().persistent().get(&v1_key) {
+            return Ok(Some(schedule));
+        }
+        let legacy_key = DataKey::TrancheSchedule(schedule_id);
+        if let Some(schedule) = env.storage().instance().get(&legacy_key) {
+            return Ok(Some(schedule));
+        }
+        Ok(None)
+    }
+
+    /// Persist a linear schedule under `LinearScheduleV1` and extend its TTL.
+    fn save_linear(env: &Env, schedule_id: u64, schedule: &VestingSchedule) {
+        let key = DataKey::LinearScheduleV1(schedule_id);
+        env.storage().persistent().set(&key, schedule);
+        bump_entry(env, &key);
+    }
+
+    /// Persist a tranche schedule under `TrancheScheduleV1` and extend its TTL.
+    fn save_tranche(env: &Env, schedule_id: u64, schedule: &TrancheSchedule) {
+        let key = DataKey::TrancheScheduleV1(schedule_id);
+        env.storage().persistent().set(&key, schedule);
+        bump_entry(env, &key);
+    }
+
+    /// Read a former beneficiary's frozen balance, checking persistent `V1`
+    /// storage first and falling back to legacy `instance` storage.
+    fn load_former_claim(env: &Env, schedule_id: u64, beneficiary: &Address) -> i128 {
+        let v1_key = DataKey::FormerBeneficiaryClaimV1(schedule_id, beneficiary.clone());
+        if let Some(amount) = env.storage().persistent().get(&v1_key) {
+            return amount;
+        }
+        let legacy_key = DataKey::FormerBeneficiaryClaim(schedule_id, beneficiary.clone());
+        env.storage().instance().get(&legacy_key).unwrap_or(0)
+    }
+
+    /// Save a former beneficiary's frozen balance in persistent `V1` storage
+    /// and extend its TTL.
+    fn save_former_claim(env: &Env, schedule_id: u64, beneficiary: &Address, amount: i128) {
+        let key = DataKey::FormerBeneficiaryClaimV1(schedule_id, beneficiary.clone());
+        env.storage().persistent().set(&key, &amount);
+        bump_entry(env, &key);
+    }
+
+    /// Remove any former beneficiary claim entry after full settlement.
+    fn clear_former_claim(env: &Env, schedule_id: u64, beneficiary: &Address) {
+        let v1_key = DataKey::FormerBeneficiaryClaimV1(schedule_id, beneficiary.clone());
+        if env.storage().persistent().has(&v1_key) {
+            env.storage().persistent().remove(&v1_key);
+        }
+        let legacy_key = DataKey::FormerBeneficiaryClaim(schedule_id, beneficiary.clone());
+        if env.storage().instance().has(&legacy_key) {
+            env.storage().instance().remove(&legacy_key);
+        }
+    }
 
     /// Load a schedule of either kind by id.
     ///
@@ -764,18 +867,10 @@ impl Vesting {
     /// counter, so the linear read is attempted first and a tranche id simply
     /// falls through to the tranche read.
     fn load(env: &Env, schedule_id: u64) -> Result<Stored, ForgeError> {
-        if let Some(schedule) = env
-            .storage()
-            .instance()
-            .get(&DataKey::Schedule(schedule_id))
-        {
+        if let Some(schedule) = Self::load_linear(env, schedule_id)? {
             return Ok(Stored::Linear(schedule));
         }
-        if let Some(schedule) = env
-            .storage()
-            .instance()
-            .get(&DataKey::TrancheSchedule(schedule_id))
-        {
+        if let Some(schedule) = Self::load_tranche(env, schedule_id)? {
             return Ok(Stored::Tranche(schedule));
         }
         Err(ForgeError::NotFound)
@@ -794,10 +889,9 @@ impl Vesting {
         if !Self::authorize_and_pay(env, &beneficiary, &schedule.token, amount)? {
             return Ok(0);
         }
-        let former_key = DataKey::FormerBeneficiaryClaim(schedule_id, beneficiary.clone());
-        let former_balance: i128 = env.storage().instance().get(&former_key).unwrap_or(0);
+        let former_balance = Self::load_former_claim(env, schedule_id, &beneficiary);
         if former_balance > 0 {
-            env.storage().instance().remove(&former_key);
+            Self::clear_former_claim(env, schedule_id, &beneficiary);
         }
         if beneficiary == schedule.beneficiary {
             let current_accrual = Self::current_beneficiary_accrual(&schedule, now)?;
@@ -811,9 +905,7 @@ impl Vesting {
             .checked_add(amount)
             .ok_or(ForgeError::ArithmeticOverflow)?;
         schedule.status = Self::current_status(&schedule, now)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::Schedule(schedule_id), &schedule);
+        Self::save_linear(env, schedule_id, &schedule);
         Ok(amount)
     }
 
@@ -840,9 +932,7 @@ impl Vesting {
             .checked_add(amount)
             .ok_or(ForgeError::ArithmeticOverflow)?;
         schedule.status = Self::tranche_status(&schedule, now)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::TrancheSchedule(schedule_id), &schedule);
+        Self::save_tranche(env, schedule_id, &schedule);
         Ok(amount)
     }
 
@@ -977,8 +1067,7 @@ impl Vesting {
         beneficiary: &Address,
         now: u64,
     ) -> Result<i128, ForgeError> {
-        let key = DataKey::FormerBeneficiaryClaim(schedule_id, beneficiary.clone());
-        let former_balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let former_balance = Self::load_former_claim(env, schedule_id, beneficiary);
         let current_accrual = if beneficiary == &schedule.beneficiary {
             Self::current_beneficiary_accrual(schedule, now)?
         } else {

@@ -1192,3 +1192,30 @@ fn claim_authorization_failure_preserves_balances_and_claimed_amounts() {
     assert_eq!(tc.balance(&contract_id), initial_contract_balance);
     assert_eq!(client.get_status(&id), VestingStatus::Vesting);
 }
+#[test]
+fn touch_ttl_preserves_vesting_state_after_ledger_advance() {
+    let (env, token, _tc, _contract_id, client, accounts) = setup!();
+    let id = client.create_schedule(
+        &accounts.deployer,
+        &accounts.user1,
+        &token,
+        &TOTAL,
+        &CLIFF,
+        &DURATION,
+    );
+
+    let initial_ttl = client.get_schedule_ttl(&id);
+    assert!(initial_ttl > 0);
+
+    let start_seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(start_seq + 250);
+
+    let before_schedule = client.get_schedule(&id);
+    client.touch_ttl(&id);
+    let after_schedule = client.get_schedule(&id);
+
+    assert!(client.get_schedule_ttl(&id) > 0);
+    assert_eq!(after_schedule.claimed, before_schedule.claimed);
+    assert_eq!(after_schedule.status, before_schedule.status);
+    assert_eq!(after_schedule.beneficiary, before_schedule.beneficiary);
+}
