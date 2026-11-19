@@ -766,7 +766,7 @@ impl DaoGovernance {
                     .checked_add(proposal.against_votes)
                     .ok_or(ForgeError::ArithmeticOverflow)?;
 
-                let required_votes = (total_supply as i128)
+                let required_votes = total_supply
                     .checked_mul(quorum_bps as i128)
                     .ok_or(ForgeError::ArithmeticOverflow)?
                     .checked_div(10000)
